@@ -1,0 +1,9 @@
+README.md
+pyproject.toml
+app/main.py
+databridge_client_service.egg-info/PKG-INFO
+databridge_client_service.egg-info/SOURCES.txt
+databridge_client_service.egg-info/dependency_links.txt
+databridge_client_service.egg-info/entry_points.txt
+databridge_client_service.egg-info/requires.txt
+databridge_client_service.egg-info/top_level.txt

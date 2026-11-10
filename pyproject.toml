@@ -1,0 +1,24 @@
+[project]
+name = "databridge-client-service"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+  "fastapi==0.115.12",
+  "uvicorn[standard]==0.34.2",
+  "SQLAlchemy==2.0.40",
+  "psycopg[binary]==3.2.9",
+  "bcrypt==4.3.0",
+  "PyJWT==2.10.1",
+  "boto3==1.38.23",
+  "email-validator==2.2.0",
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+start = "app.main:start"
+
+[tool.setuptools]
+packages = ["app"]
