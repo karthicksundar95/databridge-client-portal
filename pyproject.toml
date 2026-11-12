@@ -12,6 +12,8 @@ dependencies = [
   "boto3==1.38.23",
   "email-validator==2.2.0",
   "httpx==0.28.1",
+  "pyotp==2.9.0",
+  "cryptography==44.0.2",
 ]
 
 [build-system]

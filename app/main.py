@@ -11,6 +11,8 @@ import bcrypt
 import boto3
 import jwt
 import httpx
+import pyotp
+from cryptography.fernet import Fernet, InvalidToken
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import Depends, FastAPI, Header, HTTPException, status
@@ -35,6 +37,19 @@ OTP_DELIVERY = os.getenv("OTP_DELIVERY", "resend")
 OTP_TEST_CODE = os.getenv("OTP_TEST_CODE")
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
+DEV_MFA_ENCRYPTION_KEY = "jK8d3QmW7xP2vN5rT9yL4cF6hG1sA0bZ2eD8uI3oP7Q="
+MFA_ENCRYPTION_KEY = os.getenv("MFA_ENCRYPTION_KEY")
+if not MFA_ENCRYPTION_KEY:
+    if ENVIRONMENT == "development":
+        MFA_ENCRYPTION_KEY = DEV_MFA_ENCRYPTION_KEY
+    else:
+        raise RuntimeError("MFA_ENCRYPTION_KEY is required outside development")
+if ENVIRONMENT != "development" and MFA_ENCRYPTION_KEY == DEV_MFA_ENCRYPTION_KEY:
+    raise RuntimeError("MFA_ENCRYPTION_KEY must not use the development fallback outside development")
+try:
+    mfa_fernet = Fernet(MFA_ENCRYPTION_KEY.encode())
+except (ValueError, TypeError):
+    raise RuntimeError("MFA_ENCRYPTION_KEY must be a valid Fernet key")
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 s3_config = Config(signature_version="s3v4", s3={"addressing_style": "path"})
@@ -78,6 +93,17 @@ class RegisterRequest(ApiModel):
 class LoginRequest(ApiModel):
     email: EmailStr
     password: str
+
+
+class MfaSetupVerifyRequest(ApiModel):
+    setup_token: str
+    code: str = Field(pattern=r"^\d{6}$")
+
+
+class MfaVerifyRequest(ApiModel):
+    mfa_token: str
+    code: Optional[str] = Field(default=None, pattern=r"^\d{6}$")
+    recovery_code: Optional[str] = Field(default=None, min_length=8, max_length=32)
 
 
 class PasswordChangeRequest(ApiModel):
@@ -181,6 +207,14 @@ def current_user(authorization: Optional[str] = Header(default=None), db: Sessio
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
     if not payload.get("sub") or not payload.get("tokenId"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+    account = db.execute(
+        text("SELECT role::text AS role, status FROM users WHERE id = :user_id"),
+        {"user_id": payload["sub"]},
+    ).mappings().one_or_none()
+    if account and account["role"] != payload.get("role"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your account access has changed. Please sign in again through the portal for your new role.")
+    if account and account["status"] != "active":
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Your account is no longer active. Please contact an administrator.")
     session = db.execute(
         text("""SELECT u.role::text AS role FROM auth_sessions s JOIN users u ON u.id = s.user_id
                 WHERE s.user_id = :user_id AND s.token_id = :token_id
@@ -188,7 +222,7 @@ def current_user(authorization: Optional[str] = Header(default=None), db: Sessio
         {"user_id": payload["sub"], "token_id": payload["tokenId"]},
     ).mappings().one_or_none()
     if not session or session["role"] != payload.get("role"):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Your session has expired or was signed out. Please sign in again.")
     return payload
 
 
@@ -198,6 +232,62 @@ def safe_file_name(file_name: str) -> str:
 
 def otp_digest(code: str) -> str:
     return hmac.new(JWT_SECRET.encode(), code.encode(), hashlib.sha256).hexdigest()
+
+
+def encrypt_mfa_secret(secret: str) -> str:
+    return mfa_fernet.encrypt(secret.encode()).decode()
+
+
+def decrypt_mfa_secret(value: str) -> str:
+    try:
+        return mfa_fernet.decrypt(value.encode()).decode()
+    except (InvalidToken, ValueError):
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "MFA configuration is invalid")
+
+
+def purpose_token(user_id: str, purpose: str) -> str:
+    return jwt.encode(
+        {"sub": user_id, "purpose": purpose, "exp": datetime.now(timezone.utc) + timedelta(minutes=10)},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def decode_purpose_token(token: str, purpose: str) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "This MFA request has expired or is invalid")
+    if payload.get("purpose") != purpose or not payload.get("sub"):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "This MFA request has expired or is invalid")
+    return payload["sub"]
+
+
+def recovery_codes() -> list[str]:
+    return [f"{secrets.randbelow(100_000_000):08d}" for _ in range(10)]
+
+
+def issue_full_token(user, db: Session):
+    token_id = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+    db.execute(
+        text("INSERT INTO auth_sessions (user_id, token_id, expires_at) VALUES (:id, :token_id, :expires_at)"),
+        {"id": user["id"], "token_id": token_id, "expires_at": expires_at},
+    )
+    token = jwt.encode(
+        {"sub": str(user["id"]), "role": user["role"], "tokenId": token_id, "exp": expires_at},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    return token
+
+
+def user_response(user):
+    return {
+        "id": str(user["id"]), "email": user["email"], "role": user["role"],
+        "displayName": user["display_name"], "organization": user["organization"],
+        "countryCode": user["country_code"], "mustChangePassword": user["must_change_password"],
+    }
 
 
 def signup_email_html(code: str) -> str:
@@ -370,6 +460,7 @@ def resend_signup(payload: SignupResendRequest, db: Session = Depends(database_s
 def login(payload: LoginRequest, db: Session = Depends(database_session)):
     user = db.execute(
         text("""SELECT u.id, u.email, u.role, u.password_hash, u.must_change_password,
+                       u.mfa_enabled, u.mfa_totp_secret_encrypted, u.mfa_pending_secret_encrypted,
                        p.display_name, p.organization, p.country_code
                 FROM users u LEFT JOIN profiles p ON p.user_id = u.id
                 WHERE u.email = :email AND u.status = 'active'"""),
@@ -377,22 +468,84 @@ def login(payload: LoginRequest, db: Session = Depends(database_session)):
     ).mappings().one_or_none()
     if not user or not bcrypt.checkpw(payload.password.encode(), user["password_hash"].encode()):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
+    response = {"user": user_response(user)}
+    if not user["mfa_enabled"]:
+        pending = user["mfa_pending_secret_encrypted"]
+        if not pending:
+            pending = encrypt_mfa_secret(pyotp.random_base32())
+            db.execute(text("UPDATE users SET mfa_pending_secret_encrypted = :secret WHERE id = :id"),
+                       {"secret": pending, "id": user["id"]})
+            db.commit()
+        response.update({"mfaSetupRequired": True, "setupToken": purpose_token(str(user["id"]), "mfa-setup")})
+        return response
+    response.update({"mfaRequired": True, "mfaToken": purpose_token(str(user["id"]), "mfa-login")})
+    return response
 
-    token_id = str(uuid.uuid4())
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-    db.execute(
-        text("""INSERT INTO auth_sessions (user_id, token_id, expires_at) VALUES (:id, :token_id, :expires_at)"""),
-        {"id": user["id"], "token_id": token_id, "expires_at": expires_at},
-    )
+
+@app.get("/auth/mfa/setup")
+def mfa_setup(setup_token: str, db: Session = Depends(database_session)):
+    user_id = decode_purpose_token(setup_token, "mfa-setup")
+    secret = db.execute(text("SELECT mfa_pending_secret_encrypted FROM users WHERE id = :id AND status = 'active'"),
+                        {"id": user_id}).scalar_one_or_none()
+    if not secret:
+        raise HTTPException(status.HTTP_409_CONFLICT, "MFA setup is not available for this account")
+    return {"otpauthUri": pyotp.TOTP(decrypt_mfa_secret(secret)).provisioning_uri(
+        name=db.execute(text("SELECT email FROM users WHERE id = :id"), {"id": user_id}).scalar_one(),
+        issuer_name="DataBridge",
+    )}
+
+
+@app.post("/auth/mfa/setup/verify")
+def mfa_setup_verify(payload: MfaSetupVerifyRequest, db: Session = Depends(database_session)):
+    user_id = decode_purpose_token(payload.setup_token, "mfa-setup")
+    row = db.execute(text("SELECT email, mfa_pending_secret_encrypted FROM users WHERE id = :id AND status = 'active'"),
+                     {"id": user_id}).mappings().one_or_none()
+    if not row or not row["mfa_pending_secret_encrypted"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "MFA setup is not available for this account")
+    secret = decrypt_mfa_secret(row["mfa_pending_secret_encrypted"])
+    if not pyotp.TOTP(secret).verify(payload.code, valid_window=1):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "The authenticator code is incorrect or your phone clock is out of sync. Check the QR setup and try the current code.")
+    codes = recovery_codes()
+    for code in codes:
+        db.execute(text("INSERT INTO mfa_recovery_codes (user_id, code_hash) VALUES (:id, :hash)"),
+                   {"id": user_id, "hash": bcrypt.hashpw(code.encode(), bcrypt.gensalt()).decode()})
+    db.execute(text("""UPDATE users SET mfa_totp_secret_encrypted = mfa_pending_secret_encrypted,
+                       mfa_pending_secret_encrypted = NULL, mfa_enabled = TRUE WHERE id = :id"""), {"id": user_id})
+    user = db.execute(text("""SELECT u.id, u.email, u.role, u.must_change_password,
+                              p.display_name, p.organization, p.country_code
+                       FROM users u LEFT JOIN profiles p ON p.user_id = u.id WHERE u.id = :id"""),
+                      {"id": user_id}).mappings().one()
+    token = issue_full_token(user, db)
     db.commit()
-    token = jwt.encode({"sub": str(user["id"]), "role": user["role"], "tokenId": token_id,
-                        "exp": expires_at}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"token": token, "user": {
-        "id": str(user["id"]), "email": user["email"], "role": user["role"],
-        "displayName": user["display_name"], "organization": user["organization"],
-        "countryCode": user["country_code"],
-        "mustChangePassword": user["must_change_password"],
-    }}
+    return {"token": token, "user": user_response(user), "recoveryCodes": codes}
+
+
+@app.post("/auth/mfa/verify")
+def mfa_verify(payload: MfaVerifyRequest, db: Session = Depends(database_session)):
+    user_id = decode_purpose_token(payload.mfa_token, "mfa-login")
+    user = db.execute(text("""SELECT u.id, u.email, u.role, u.must_change_password, u.mfa_totp_secret_encrypted,
+                              p.display_name, p.organization, p.country_code
+                       FROM users u LEFT JOIN profiles p ON p.user_id = u.id
+                       WHERE u.id = :id AND u.status = 'active' AND u.mfa_enabled = TRUE"""),
+                      {"id": user_id}).mappings().one_or_none()
+    if not user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "MFA is not enabled for this account")
+    valid = bool(payload.code and pyotp.TOTP(decrypt_mfa_secret(user["mfa_totp_secret_encrypted"])).verify(payload.code, valid_window=1))
+    recovery_id = None
+    if not valid and payload.recovery_code:
+        candidates = db.execute(text("""SELECT id, code_hash FROM mfa_recovery_codes
+                                        WHERE user_id = :id AND used_at IS NULL"""), {"id": user_id}).mappings()
+        for candidate in candidates:
+            if bcrypt.checkpw(payload.recovery_code.encode(), candidate["code_hash"].encode()):
+                valid, recovery_id = True, candidate["id"]
+                break
+    if not valid:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "The authenticator or recovery code is incorrect")
+    if recovery_id:
+        db.execute(text("UPDATE mfa_recovery_codes SET used_at = NOW() WHERE id = :id"), {"id": recovery_id})
+    token = issue_full_token(user, db)
+    db.commit()
+    return {"token": token, "user": user_response(user)}
 
 
 @app.post("/auth/logout", status_code=204)
@@ -538,6 +691,10 @@ def admin_update_user(
         text("UPDATE users SET role = CAST(:role AS user_role) WHERE id = :id"),
         {"role": payload.role, "id": user_id},
     )
+    db.execute(
+        text("UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL"),
+        {"id": user_id},
+    )
     write_audit_log(db, user["sub"], "user.role_changed", "user", str(user_id), f"Role changed from {target['role']} to {payload.role}")
     db.commit()
     return {"id": str(user_id), "role": payload.role}
@@ -567,6 +724,22 @@ def admin_reset_user_password(user_id: uuid.UUID, user=Depends(current_user), db
     write_audit_log(db, user["sub"], "user.password_reset", "user", str(user_id), "Temporary password issued by administrator")
     db.commit()
     return {"id": str(user_id), "email": target["email"], "temporaryPassword": temporary_password, "mustChangePassword": True}
+
+
+@app.post("/admin/users/{user_id}/reset-mfa")
+def admin_reset_user_mfa(user_id: uuid.UUID, user=Depends(current_user), db: Session = Depends(database_session)):
+    require_role(user, "administrator")
+    target = db.execute(text("SELECT id, email FROM users WHERE id = :id"), {"id": user_id}).mappings().one_or_none()
+    if not target:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    db.execute(text("""UPDATE users SET mfa_enabled = FALSE, mfa_totp_secret_encrypted = NULL,
+                       mfa_pending_secret_encrypted = NULL WHERE id = :id"""), {"id": user_id})
+    db.execute(text("DELETE FROM mfa_recovery_codes WHERE user_id = :id"), {"id": user_id})
+    db.execute(text("UPDATE auth_sessions SET revoked_at = NOW() WHERE user_id = :id AND revoked_at IS NULL"),
+               {"id": user_id})
+    write_audit_log(db, user["sub"], "user.mfa_reset", "user", str(user_id), "MFA reset by administrator")
+    db.commit()
+    return {"id": str(user_id), "email": target["email"], "mfaReset": True}
 
 
 @app.patch("/admin/users/{user_id}/status")

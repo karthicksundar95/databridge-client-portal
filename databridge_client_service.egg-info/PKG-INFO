@@ -10,3 +10,6 @@ Requires-Dist: bcrypt==4.3.0
 Requires-Dist: PyJWT==2.10.1
 Requires-Dist: boto3==1.38.23
 Requires-Dist: email-validator==2.2.0
+Requires-Dist: httpx==0.28.1
+Requires-Dist: pyotp==2.9.0
+Requires-Dist: cryptography==44.0.2
